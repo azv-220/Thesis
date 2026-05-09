@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local environments and machine-specific config
+.venv/
+config/config_user.yaml
+
+# Large/local data and generated outputs
+raw_inputs/
+analysis/build/
+*.csv
+*.parquet
+*.h5
+*.duckdb
+*.log
