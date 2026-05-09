@@ -1,0 +1,11 @@
+# Copy this file to config/config_user.yaml and adjust paths for your machine.
+paths:
+  raw_csv_dir: "/Users/aurash/Desktop/Thesis Codex Refresh"
+  event_input_dir: "raw_inputs/event_fund_ids"
+  build_dir: "analysis/build"
+
+raw_files:
+  donations_csv: "temp_merged_sorted_cleaned.csv"
+  fundraisers_csv: "temp_funds_sorted_cleaned_lower.csv"
+
+usb_event_source_dir: "/Volumes/THESIS BACK/thesis"
