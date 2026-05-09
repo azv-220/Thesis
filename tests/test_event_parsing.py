@@ -13,5 +13,5 @@ def test_parse_event_id_no_extension():
 
 def test_parse_event_file_uses_numeric_last_column(tmp_path: Path):
     path = tmp_path / "all_trial_fund_ids.csv"
-    path.write_text(",0\n0,123\n1,456\nbad,not_id\n")
+    path.write_text(",0\n0,123\n1,456.0\nbad,not_id\n")
     assert parse_event_file(path) == ["123", "456"]
