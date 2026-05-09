@@ -51,6 +51,7 @@ FUNDRAISER_COLUMNS = [
 
 EVENT_FILE_RE = re.compile(r"^all_.*fund_ids(?:\.csv)?$")
 INTEGER_RE = re.compile(r"^\d+$")
+WHOLE_FLOAT_RE = re.compile(r"^(\d+)\.0+$")
 
 
 def ensure_dirs(config: PipelineConfig) -> None:
@@ -74,6 +75,11 @@ def write_json(path: Path, payload: dict | list) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=json_default) + "\n")
 
 
+def remove_existing(path: Path) -> None:
+    if path.exists():
+        path.unlink()
+
+
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -93,7 +99,7 @@ def read_csv_expr(path: Path, columns: list[str]) -> str:
         f"columns={duck_columns(columns)}, "
         "strict_mode=false, "
         "ignore_errors=false, "
-        "parallel=true)"
+        "parallel=false)"
     )
 
 
@@ -101,6 +107,18 @@ def normalize_string_sql(column: str) -> str:
     return (
         f"CASE WHEN {column} IS NULL OR {column} = '' OR lower({column}) = 'nan' "
         f"THEN NULL ELSE {column} END"
+    )
+
+
+def normalize_id_sql(column: str) -> str:
+    normalized = normalize_string_sql(column)
+    return (
+        f"CASE "
+        f"WHEN {normalized} IS NULL THEN NULL "
+        f"WHEN regexp_matches({normalized}, '^[0-9]+$') THEN {normalized} "
+        f"WHEN regexp_matches({normalized}, '^[0-9]+\\.0+$') "
+        f"THEN regexp_extract({normalized}, '^([0-9]+)\\.0+$', 1) "
+        f"ELSE NULL END"
     )
 
 
@@ -190,6 +208,7 @@ def build_raw_parquet(config: PipelineConfig) -> None:
         if not source.exists():
             raise FileNotFoundError(f"Raw input not found: {source}")
         target.parent.mkdir(parents=True, exist_ok=True)
+        remove_existing(target)
         expr = read_csv_expr(source, columns)
         con.execute(
             f"""
@@ -207,6 +226,7 @@ def build_raw_parquet(config: PipelineConfig) -> None:
     event_raw_dir.mkdir(parents=True, exist_ok=True)
     for source in sorted(config.event_input_dir.glob("all_*fund_ids*")):
         target = event_raw_dir / f"{source.name}.parquet"
+        remove_existing(target)
         rows = parse_event_file(source)
         temp_csv = config.build_dir / "tmp" / f"{source.name}.csv"
         temp_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -254,6 +274,10 @@ def parse_event_file(path: Path) -> list[str]:
                 continue
             if INTEGER_RE.match(candidate):
                 fund_ids.append(candidate)
+                continue
+            match = WHOLE_FLOAT_RE.match(candidate)
+            if match:
+                fund_ids.append(match.group(1))
     return fund_ids
 
 
@@ -288,6 +312,8 @@ def build_curated_tables(config: PipelineConfig) -> None:
     dim_target = config.curated_dir / "dim_fundraisers.parquet"
     text_target = config.curated_dir / "fundraiser_text.parquet"
     event_target = config.curated_dir / "event_membership.parquet"
+    for target in [fact_target, dim_target, text_target, event_target]:
+        remove_existing(target)
 
     created_at_expr = timestamp_sql("created_at")
     con.execute(
@@ -295,7 +321,7 @@ def build_curated_tables(config: PipelineConfig) -> None:
         COPY (
             SELECT
                 {normalize_string_sql('donation_id')} AS donation_id,
-                {normalize_string_sql('fund_id')} AS fund_id,
+                {normalize_id_sql('fund_id')} AS fund_id,
                 try_cast(nullif(amount, '') AS DOUBLE) AS amount,
                 {created_at_expr} AS created_at,
                 cast({created_at_expr} AS DATE) AS donation_date,
@@ -319,16 +345,33 @@ def build_curated_tables(config: PipelineConfig) -> None:
         f"""
         COPY (
             SELECT
-                {normalize_string_sql('fund_id')} AS fund_id,
-                {fundraiser_date_expr} AS date_created,
-                try_cast(nullif(N_donors, '') AS BIGINT) AS n_donors,
-                try_cast(nullif(progress, '') AS DOUBLE) AS progress,
-                try_cast(nullif(goal, '') AS DOUBLE) AS goal,
-                {normalize_string_sql('tag')} AS tag,
-                {normalize_string_sql('organizer_city')} AS organizer_city,
-                {normalize_string_sql('city')} AS city,
-                {normalize_string_sql('state')} AS state
-            FROM read_parquet('{quote(fundraisers_raw)}')
+                fund_id,
+                date_created,
+                n_donors,
+                progress,
+                goal,
+                tag,
+                organizer_city,
+                city,
+                state
+            FROM (
+                SELECT
+                    {normalize_id_sql('fund_id')} AS fund_id,
+                    {fundraiser_date_expr} AS date_created,
+                    try_cast(nullif(N_donors, '') AS BIGINT) AS n_donors,
+                    try_cast(nullif(progress, '') AS DOUBLE) AS progress,
+                    try_cast(nullif(goal, '') AS DOUBLE) AS goal,
+                    {normalize_string_sql('tag')} AS tag,
+                    {normalize_string_sql('organizer_city')} AS organizer_city,
+                    {normalize_string_sql('city')} AS city,
+                    {normalize_string_sql('state')} AS state,
+                    row_number() OVER (
+                        PARTITION BY {normalize_id_sql('fund_id')}
+                        ORDER BY try_cast(__index_0 AS BIGINT) NULLS LAST
+                    ) AS rn
+                FROM read_parquet('{quote(fundraisers_raw)}')
+            )
+            WHERE rn = 1 AND fund_id IS NOT NULL
         )
         TO '{quote(dim_target)}'
         (FORMAT PARQUET, COMPRESSION ZSTD);
@@ -339,13 +382,27 @@ def build_curated_tables(config: PipelineConfig) -> None:
         f"""
         COPY (
             SELECT
-                {normalize_string_sql('fund_id')} AS fund_id,
-                {normalize_string_sql('title')} AS title,
-                {normalize_string_sql('description')} AS description,
-                try_cast(nullif(length, '') AS BIGINT) AS length,
-                {normalize_string_sql('url')} AS url,
-                {normalize_string_sql('organizer_name')} AS organizer_name
-            FROM read_parquet('{quote(fundraisers_raw)}')
+                fund_id,
+                title,
+                description,
+                length,
+                url,
+                organizer_name
+            FROM (
+                SELECT
+                    {normalize_id_sql('fund_id')} AS fund_id,
+                    {normalize_string_sql('title')} AS title,
+                    {normalize_string_sql('description')} AS description,
+                    try_cast(nullif(length, '') AS BIGINT) AS length,
+                    {normalize_string_sql('url')} AS url,
+                    {normalize_string_sql('organizer_name')} AS organizer_name,
+                    row_number() OVER (
+                        PARTITION BY {normalize_id_sql('fund_id')}
+                        ORDER BY try_cast(__index_0 AS BIGINT) NULLS LAST
+                    ) AS rn
+                FROM read_parquet('{quote(fundraisers_raw)}')
+            )
+            WHERE rn = 1 AND fund_id IS NOT NULL
         )
         TO '{quote(text_target)}'
         (FORMAT PARQUET, COMPRESSION ZSTD);
